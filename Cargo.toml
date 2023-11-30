@@ -1,0 +1,16 @@
+[package]
+name = "akademlia-rs"
+version = "0.0.1"
+edition = "2021"
+
+
+[dependencies]
+rand = "0.8.5"
+log = "0.4"
+rpcudp-rs = { git = "https://github.com/randombtree/rpcudp-rs.git" }
+itertools = "0.12.0"
+
+[dev-dependencies]
+rand = { version = "0.8.5", features = [ "small_rng" ] }
+env_logger = "0.8"
+test-log = "0.2"
