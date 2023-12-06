@@ -8,11 +8,22 @@ use std::slice::Iter;
 
 use log::trace;
 
+use serde::{Deserialize, Serialize};
+
 use super::key::*;
 use super::peer::*;
-use super::kbucket::KBucket;
+use super::kbucket::{KBucket, KBucketDiskV1};
 
 
+/// On-disk format for RoutingTable
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RTDiskV1 {
+    node: Key,
+    buckets: Vec<KBucketDiskV1>,
+}
+
+
+/// Kademlia routing table
 pub struct RoutingTable {
     node: PeerAddress,
     buckets: Vec<KBucket>,
@@ -29,6 +40,10 @@ impl RoutingTable {
 	    buckets,
 	    peers,
 	}
+    }
+
+    pub fn node(&self) -> PeerAddress {
+	self.node.clone()
     }
 
     /// Get peer for incoming source and with kad address.
@@ -120,8 +135,38 @@ impl RoutingTable {
 	}
     }
 
+    pub(crate) fn serialize(&self) -> RTDiskV1 {
+	let buckets = self.buckets.iter().map(|kb| kb.serialize()).collect();
+	let node = *self.node.clone();
+	RTDiskV1 {
+	    buckets,
+	    node,
+	}
+    }
+
     #[cfg(test)]
     pub(crate) fn iter_buckets<'a>(&'a self) -> Iter<'a, KBucket> {
 	self.buckets.iter()
+    }
+}
+
+
+impl From <RTDiskV1> for RoutingTable {
+    fn from(disk: RTDiskV1) -> Self {
+	let node = Arc::new(disk.node);
+	let mut peers = HashMap::new();
+	let buckets = disk.buckets.into_iter().map(|dbucket| {
+	    let kbucket: KBucket = dbucket.into();
+	    // Need to add the peers to the hashmap
+	    for peer in kbucket.peers.iter().chain(kbucket.cache.iter()) {
+		peers.insert(peer.address.clone(), Arc::downgrade(peer));
+	    }
+	    kbucket
+	}).collect();
+	RoutingTable {
+	    node,
+	    buckets,
+	    peers,
+	}
     }
 }

@@ -1,8 +1,21 @@
+use std::sync::Arc;
+
 use itertools::Itertools;
+
+use serde::{Deserialize, Serialize};
 
 use crate::util::ringbuffer::RingBuffer;
 use super::constants::*;
 use super::peer::*;
+
+
+/// On-disk format for KBucket
+#[derive(Serialize, Deserialize)]
+pub struct KBucketDiskV1 {
+    peers: Vec<RoutingPeerDiskV1>,
+    cache: Vec<RoutingPeerDiskV1>,
+}
+
 
 pub(crate) struct KBucket {
     /// The active route targets in this KBucket.
@@ -118,6 +131,31 @@ impl KBucket {
 	KBucket {
 	    peers,
 	    cache,
+	}
+    }
+
+    pub fn serialize(&self) -> KBucketDiskV1 {
+	let peers = self.peers.iter().map(|p| p.serialize()).collect();
+	let cache = self.cache.iter().map(|p| p.serialize()).collect();
+	KBucketDiskV1 {
+	    peers,
+	    cache,
+	}
+    }
+}
+
+
+impl From<KBucketDiskV1> for KBucket {
+    fn from(disk: KBucketDiskV1) -> Self {
+	let peers = disk.peers.into_iter()
+	    .map(|p| Arc::new(p.into()))
+	    .collect();
+	let cache = disk.cache.into_iter()
+	    .map(|p| Arc::new(p.into()))
+	    .collect();
+	KBucket {
+	    peers,
+	    cache
 	}
     }
 }

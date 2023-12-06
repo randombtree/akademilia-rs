@@ -4,13 +4,14 @@ use std::cmp::{Ord, Ordering, PartialOrd};
 
 use rand::{Rng, CryptoRng};
 
+use serde::{Deserialize, Serialize};
 
 use super::constants::*;
 
 type KadBytes = [u8; KAD_BYTES];
 
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Key(KadBytes);
 
 impl Default for Key {
@@ -123,7 +124,7 @@ impl Ord for Key {
 }
 
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Distance {
     /// XOR key
     key: Key,
