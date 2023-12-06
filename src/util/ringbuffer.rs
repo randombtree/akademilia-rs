@@ -273,6 +273,8 @@ impl <T, const S: usize> Extend<T> for RingBuffer<T, S> {
     }
 }
 
+unsafe impl <T: Send, const S: usize> Send for RingBuffer<T, S> {}
+unsafe impl <T: Sync, const S: usize> Sync for RingBuffer<T, S> {}
 
 #[cfg(test)]
 mod test {
