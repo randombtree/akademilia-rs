@@ -93,6 +93,10 @@ impl RoutingPeer {
 	mutable.last_try = Instant::now();
     }
 
+    pub fn address(&self) -> PeerAddress {
+	self.address.clone()
+    }
+
     pub fn peer(&self) -> SocketAddr {
 	self.mutable.lock().and_then(|m| Ok(m.peer)).unwrap()
     }

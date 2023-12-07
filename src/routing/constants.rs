@@ -11,3 +11,6 @@ pub const KAD_BYTES: usize = KAD_BITS / 8;
 
 /// Kick peer from KBucket after this many errors
 pub const MAX_ERRORS: usize = 5;
+
+/// Maximum time to wait for node reply
+pub const MAX_RTT_MS: u64 = 1500;
