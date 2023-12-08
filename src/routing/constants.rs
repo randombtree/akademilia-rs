@@ -14,3 +14,6 @@ pub const MAX_ERRORS: usize = 5;
 
 /// Maximum time to wait for node reply
 pub const MAX_RTT_MS: u64 = 1500;
+
+/// Maximum concurrency per operation
+pub const KAD_ALPHA: i32 = 3;

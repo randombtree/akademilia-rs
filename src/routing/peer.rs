@@ -207,6 +207,27 @@ impl PartialEq for RoutingPeer {
 }
 
 
+impl Eq for RoutingPeer {}
+
+
+impl PartialOrd for RoutingPeer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+	// Reverse ordering here:
+	// The distance is ordered by matching bits,
+	// i.e. the furthest distance is first,
+	// But with peers we usually want the closes nodes first :)
+	other.distance.partial_cmp(&self.distance)
+    }
+}
+
+
+impl Ord for RoutingPeer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+	self.partial_cmp(other).unwrap()
+    }
+}
+
+
 #[derive(PartialEq)]
 struct RoutingPeerMutable {
     /// Last known contact (note: Kad provides no spoofing protection)

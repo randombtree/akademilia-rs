@@ -4,7 +4,10 @@ use itertools::Itertools;
 
 use serde::{Deserialize, Serialize};
 
-use crate::util::ringbuffer::RingBuffer;
+use crate::util::ringbuffer::{
+    RingBuffer,
+    RingIterator,
+};
 use super::constants::*;
 use super::peer::*;
 
@@ -134,6 +137,12 @@ impl KBucket {
 	}
     }
 
+    pub fn iter<'a>(&'a self) -> Iter<'a> {
+	Iter::new(self.peers.iter())
+    }
+
+    pub fn len(&self) -> usize { self.peers.len() }
+
     pub fn serialize(&self) -> KBucketDiskV1 {
 	let peers = self.peers.iter().map(|p| p.serialize()).collect();
 	let cache = self.cache.iter().map(|p| p.serialize()).collect();
@@ -141,6 +150,28 @@ impl KBucket {
 	    peers,
 	    cache,
 	}
+    }
+}
+
+
+pub struct Iter<'a> {
+    iter: RingIterator<'a, Peer, KAD_K>,
+}
+
+
+impl<'a> Iter<'a> {
+    fn new(iter: RingIterator<'a, Peer, KAD_K>) -> Iter<'a> {
+	Iter {
+	    iter
+	}
+    }
+}
+
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = &'a Peer;
+    fn next(&mut self) -> Option<Self::Item> {
+	self.iter.next()
     }
 }
 
