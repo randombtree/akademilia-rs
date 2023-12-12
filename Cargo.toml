@@ -2,6 +2,8 @@
 name = "akademlia-rs"
 version = "0.0.1"
 edition = "2021"
+# Still missing const_alloc_layout
+rust-version = "1.76.0"
 
 [features]
 default = ["async-std"]

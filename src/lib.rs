@@ -1,4 +1,3 @@
-#![feature(generic_const_exprs)]
 #![feature(const_alloc_layout)]
 
 #[cfg(all(feature = "async-std", feature = "tokio"))]
