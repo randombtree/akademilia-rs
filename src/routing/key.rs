@@ -6,6 +6,8 @@ use rand::{Rng, CryptoRng};
 
 use serde::{Deserialize, Serialize};
 
+use sha2::{Sha256, Digest};
+
 use super::constants::*;
 
 type KadBytes = [u8; KAD_BYTES];
@@ -123,6 +125,24 @@ impl Ord for Key {
     }
 }
 
+// Sadly, Rusts "forward compatibility" disallows generic AsRef<&str> implementation
+/// Create key from str by hashing it
+impl From<&str> for Key
+{
+    fn from(value: &str) -> Self {
+	let digest = Sha256::digest(value);
+	// TODO: Fix this when crypto updates to generic-array version that supports into_array
+	let slice: &KadBytes = digest.as_ref();
+	Key::from_fn(|i| slice[i])
+    }
+}
+
+impl From<String> for Key {
+    fn from(value: String) -> Self {
+	Key::from(value.as_ref())
+    }
+}
+
 
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Distance {
@@ -214,5 +234,11 @@ mod test {
 	assert!("Key (0000000000000000000000000000000000000000000000000000000000000000)" == format!("{}", zero));
 	let full = Key::from_fn(|_| 0xFFu8);
 	assert!("Key (FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF)" ==  format!("{}", full));
+    }
+
+    #[test]
+    fn test_key_from_str() {
+	assert!(Key::from("foo") == Key::from(String::from("foo")));
+	assert!(Key::from("bar") != Key::from("foo"));
     }
 }
