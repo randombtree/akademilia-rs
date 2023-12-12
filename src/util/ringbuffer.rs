@@ -110,7 +110,7 @@ where
     pub fn pop(&mut self) -> Option<T> {
 	(!self.is_empty()).then(|| {
 	    let tail = self.tail;
-	    self.tail = (self.tail + S - 1) % 8;
+	    self.tail = (self.tail + S - 1) % S;
 	    self.length -= 1;
 	    // Unsafe: self.tail is safe
 	    unsafe { std::ptr::read(self.ptr.as_ptr().add(tail)) }
