@@ -4,6 +4,7 @@ use std::sync::{
 };
 use std::cmp::{Ord, Ordering, PartialOrd};
 
+use paste::paste;
 
 use crate::routing::{
     peer::{Peer, },
@@ -15,6 +16,8 @@ pub struct SpiderPeer(Arc<SpiderPeerInner>);
 pub struct SpiderPeerInner {
     peer: Peer,
     visited: atomic::AtomicBool,
+    finished: atomic::AtomicBool,
+    stored: atomic::AtomicBool,
     failed: atomic::AtomicBool,
 }
 
@@ -43,30 +46,43 @@ impl Ord for SpiderPeer {
 }
 
 
+macro_rules! atomic_getset {
+    ($self_:ident, $name:ident) => {
+	paste! {
+	    #[allow(unused)]
+	    pub fn [<has _ $name>](& $self_) -> bool {
+		$self_.0.$name.load(atomic::Ordering::Relaxed)
+	    }
+
+	    #[allow(unused)]
+	    pub fn [<set _ $name>](& $self_) {
+		$self_.0.$name.store(true, atomic::Ordering::Relaxed)
+	    }
+
+	    #[allow(unused)]
+	    pub fn [<clear _ $name>](& $self_) {
+		$self_.0.$name.store(false, atomic::Ordering::Relaxed)
+	    }
+	}
+    }
+}
+
+
 impl SpiderPeer {
     pub fn new(peer: Peer) -> SpiderPeer {
 	SpiderPeer(Arc::new(SpiderPeerInner {
 	    peer,
 	    visited: atomic::AtomicBool::new(false),
+	    stored: atomic::AtomicBool::new(false),
+	    finished: atomic::AtomicBool::new(false),
 	    failed: atomic::AtomicBool::new(false),
 	}))
     }
 
     pub fn peer(&self) -> &Peer { &self.0.peer }
 
-    pub fn set_visited(&self) {
-	self.0.visited.store(true, atomic::Ordering::Relaxed);
-    }
-
-    pub fn visited(&self) -> bool {
-	self.0.visited.load(atomic::Ordering::Relaxed)
-    }
-
-    pub fn set_failed(&self) {
-	self.0.failed.store(true, atomic::Ordering::Relaxed);
-    }
-
-    pub fn failed(&self) -> bool {
-	self.0.failed.load(atomic::Ordering::Relaxed)
-    }
+    atomic_getset!{ self, visited }
+    atomic_getset!{ self, stored }
+    atomic_getset!{ self, finished }
+    atomic_getset!{ self, failed }
 }

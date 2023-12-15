@@ -4,6 +4,7 @@ use std::sync::{
     Mutex,
 };
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::io::{
@@ -12,8 +13,12 @@ use std::io::{
     ErrorKind as IOErrorKind,
 };
 use std::time::Duration;
+use std::pin::Pin;
+use std::future::Future;
 
 use futures::future::select_all;
+use futures::future::FutureExt;
+use futures::select;
 
 use rand::Rng;
 
@@ -21,14 +26,17 @@ use serde::{Deserialize, Serialize};
 use rmp_serde::decode;
 use rmp_serde::encode;
 
-use log::trace;
+use log::{
+    info,
+    trace,
+};
 
 use rpcudp_rs::{
     compat::time::timeout,
     RpcServer, rpc
 };
 
-use super::routing::{
+use crate::routing::{
     constants::{
 	KAD_ALPHA,
 	KAD_K,
@@ -41,6 +49,7 @@ use super::routing::{
 	RTDiskV1,
     }
 };
+use crate::util::futures::PlaceholderFuture;
 
 mod spider;
 use self::spider::SpiderPeer;
@@ -76,13 +85,18 @@ rpc! {
 	    }).expect("Memory corruption")
 	}
 
-	async fn store(&self, context: RpcContext) {
-	    let _node = self.node();
-	    trace!("Store from {}", context.source);
+	async fn store(&self, context: RpcContext, node_key: Key, key: Key, data: Vec<u8>) {
+	    let node = self.node()
+		.expect("Node disappeared");
+	    trace!("store from {}", context.source);
+	    // TODO: Store stub
+	    node.0.lock().map(|mut node| {
+		node.store.insert(key, data);
+	    });
 	}
 
 	async fn find_node(&self, context: RpcContext, node_key: Key, find_key: Key) -> Vec<NodeAddress> {
-	    trace!("Store from {}", context.source);
+	    trace!("find_node from {}", context.source);
 	    let node = self.node()
 		.expect("Node disappeared");
 	    node.0.lock().map(|mut node| {
@@ -92,7 +106,7 @@ rpc! {
 	}
 
 	async fn find_value(&self, context: RpcContext) {
-	    trace!("Store from {}", context.source);
+	    trace!("find_value from {}", context.source);
 	    let _node = self.node()
 		.expect("Node disappeared");
 
@@ -124,44 +138,156 @@ impl NodeSpider {
 	}
     }
 
-    fn push(&mut self, peer :Peer) {
+    fn push(&mut self, peer: Peer) {
 	self.peers.insert(SpiderPeer::new(peer));
     }
 
+    fn extend<I>(&mut self, iter: I)
+	where I: IntoIterator<Item = Peer>
+    {
+	self.peers.extend(
+	    iter.into_iter().map(|peer| SpiderPeer::new(peer))
+	);
+    }
 
-    pub async fn find_node(&mut self) -> Vec<Peer> {
-	trace!("Starting find_node spider");
-	let mut finders = Vec::new();
+    fn add_finders<'a>(&'a mut self, count: usize) -> impl Iterator<Item=Pin<Box<impl Future<Output=Option<Vec<Peer>>>>>> + 'a {
+	self.peers.iter()
+	    .filter(|p| !p.has_failed())   // Ignore failed nodes
+	    .take(KAD_K)  // We continue until the KAD_K best nodes are probed
+	    .filter(|p| !p.has_visited())
+	    .take(count)  // Ensure max alpha ops
+	    .map(|p| {
+		p.set_visited();
+		// Shed any references
+		let target = (*self.target).clone();
+		let spider_peer = p.clone();
+		let node = self.node.clone();
+		Box::pin(async move {
+		    let ret = node.find_node(spider_peer.peer(), target).await;
+		    if ret.is_none() {
+			trace!("Peer {} find_node failed", spider_peer.peer().peer());
+			// This node shouldn't count towards the KAD_K nodes returned
+			spider_peer.set_failed();
+		    } else {
+			spider_peer.set_finished();
+		    }
+		    ret
+		})
+	    })
+    }
+
+    /// Store value to K closest peers
+    pub async fn store(&mut self, value: Vec<u8>) -> usize {
+	trace!("Storing");
+	let node_key = self.node.node_key();
+	let mut finders = Some(Vec::new()); // Is none while awaiting future to finish
+	let mut finders_count = 0; // Need to store length outside vec as future takes it
+	let mut finders_finished = false;  // Once no more new nodes can be found, stop looking
+	let mut storers = Some(Vec::new());
+	let mut storers_count = 0;
+	let mut finders_fut = PlaceholderFuture::new();
+	let mut storers_fut = PlaceholderFuture::new();
+	let mut successfully_stored = 0;
+
 	loop {
-	    let add: i32 = KAD_ALPHA - i32::try_from(finders.len()).unwrap();
-	    if add > 0 {
-		finders.extend(
+	    // First, use all concurrency to search closer nodes (=routing)
+	    let add_finders = KAD_ALPHA - finders_count - storers_count;
+	    if !finders_finished && finders.is_some() && add_finders > 0  {
+		let mut finders = finders.take().unwrap();
+		finders.extend(self.add_finders(add_finders));
+		finders_count = finders.len();
+		// select_all panics if iterator is empty :)
+		if finders_count > 0 {
+		    finders_fut.apply(Box::pin(select_all(finders.into_iter()).fuse()));
+		} else {
+		    // Didn't find more nodes, don't bother searching the list anymore
+		    finders_finished = true;
+		}
+	    }
+
+	    // Once not all finders are busy, we can start storing
+	    // Theoretically it can result in inserting to more than K nodes if a good node is
+	    // found from a slow peer in the end of the routing
+	    let add_storers = KAD_ALPHA - finders_count - storers_count;
+	    if storers.is_some() &&  add_storers > 0 {
+		let mut storers = storers.take().unwrap();
+		storers.extend(
 		    self.peers.iter()
-			.filter(|p| !p.failed())   // Ignore failed nodes
-			.take(KAD_K)  // We continue until the KAD_K best nodes are probed
-			.filter(|p| !p.visited())
-			.take(add.try_into().unwrap())  // Ensure max alpha ops
+			.filter(|p| !p.has_failed())  // Ignore failed ones;
+			.take(KAD_K)                  // Store to the best K nodes
+			.filter(|p| p.has_finished() && !p.has_stored())
+			.take(add_storers)            // Obey concurrency
 			.map(|p| {
-			    p.set_visited();
+			    p.set_stored();
+			    p.clear_finished();  // New round
 			    // Shed any references
 			    let target = (*self.target).clone();
 			    let spider_peer = p.clone();
 			    let node = self.node.clone();
+			    let value = value.clone(); // TODO: Make rpcudp take value by reference
 			    Box::pin(async move {
-				let ret = node.find_node(spider_peer.peer(), target).await;
+				let ret = node.store_on(spider_peer.peer(), target, value).await;
 				if ret.is_none() {
-				    trace!("Peer {} find_node failed", spider_peer.peer().peer());
-				    // This node shouldn't count towards the KAD_K nodes returned
+				    trace!("Store failed");
 				    spider_peer.set_failed();
+				} else {
+				    spider_peer.set_finished();
 				}
 				ret
 			    })
-			})
-		);
+			}));
+		storers_count = storers.len();
+		// select_all panics if iterator is empty :)
+		if storers_count > 0 {
+		    storers_fut.apply(Box::pin(select_all(storers.into_iter()).fuse()));
+		}
 	    }
+
+	    if finders_count + storers_count == 0 {
+		// No work more to be done
+		trace!("Finished: stored into {} nodes", successfully_stored);
+		break successfully_stored
+	    }
+
+	    // Run pending futures
+	    select! {
+		(resolved, _index, new_finders) = finders_fut => {
+		    finders_count -= 1;
+		    if let Some(list) = resolved {
+			self.peers.extend(
+			    list.into_iter()
+				.filter(|peer| peer.address != node_key)
+				.map(|peer| SpiderPeer::new(peer)));
+		    }
+		    finders = Some(new_finders);
+		},
+		(resolved, _index, new_storers) = storers_fut => {
+		    storers_count -= 1;
+		    if resolved.is_some() {
+			successfully_stored += 1;
+			trace!("Progress: stored into {} node(s)", successfully_stored);
+		    }
+		    // The future does the peer marking, nothing other needs to be done..
+		    storers = Some(new_storers);
+		}
+	    }
+	}
+    }
+
+    /// Find K closest peers
+    pub async fn find_node(&mut self) -> Vec<Peer> {
+	trace!("Starting find_node spider");
+	let node_key = self.node.node_key();
+	let mut finders = Vec::new();
+	loop {
+	    let add = KAD_ALPHA - finders.len();
+	    if add > 0 {
+		finders.extend(self.add_finders(add))
+	    }
+
 	    if finders.len() == 0 {
 		let found: Vec<_> = self.peers.iter()
-		    .filter(|p| !p.failed())
+		    .filter(|p| !p.has_failed())
 		    .take(KAD_K)
 		    .map(|p| p.peer().clone())
 		    .collect();
@@ -174,6 +300,7 @@ impl NodeSpider {
 	    if let Some(list) = resolved {
 		self.peers.extend(
 		    list.into_iter()
+			.filter(|peer| peer.address != node_key)
 			.map(|peer| SpiderPeer::new(peer))
 		);
 	    }
@@ -276,6 +403,23 @@ impl Node {
 	}).expect("Memory corruption")
     }
 
+    /// Store (key, value) into KAD network.
+    pub async fn store<K>(&self, key: K, value: Vec<u8>) -> Result<usize, ()>
+    where K: Into<Key>,
+    {
+	let key = key.into();
+	let nodes = self.0.lock().map(|node| node.rtable.find_node(&key))
+	    .expect("Memory corruption");
+	if nodes.len() == 0 {
+	    info!("Node has no known routing peers, needs bootstrapping!");
+	    return Err(()) // TODO: Error
+	}
+	let key = Arc::new(key);
+	let mut spider = NodeSpider::new(self.clone(), key.clone());
+	spider.extend(nodes);
+	Ok(spider.store(value).await)
+    }
+
     /// Bootstrap node from other node
     /// By bootstrapping the node, this node will re-initialize it's routing
     /// table and join the DHT network known by the other node.
@@ -336,11 +480,35 @@ impl Node {
 		}).expect("Memory corruption")
 	    })
     }
+
+    pub(crate) async fn store_on(&self, peer: &Peer, key: Key, value: Vec<u8>) -> Option<()> {
+	let (rpc, node_key) = self.0.lock().map(|node| {
+	    let rpc = node.rpc.clone().expect("Bug: Node not initialized");
+	    (rpc, (*node.rtable.node()).clone())
+	}).expect("Memory corruption");
+	let peer_socket = peer.peer();
+	peer.update_try();
+	timeout(Duration::from_millis(MAX_RTT_MS),
+		rpc.store(peer_socket, node_key, key, value)).await
+	    .inspect_err(|_| {
+		trace!("Peer {} timed out on find_node", peer_socket);
+		peer.inc_errors();
+	    })
+	    .map(|ret| {
+		ret.inspect_err(|_| {
+		    trace!("Peer {} RPC error", peer_socket);
+		    peer.inc_errors();
+		}).ok()
+	    }).ok().flatten()
+	    .inspect(|_| peer.update_seen())
+    }
 }
 
 
 struct NodeStruct {
     rtable: RoutingTable,
+    /// Store stub (TODO)
+    store: HashMap<Key, Vec<u8>>,
     rpc: Option<Arc<RpcServer<NodeService>>>
 }
 
@@ -349,6 +517,7 @@ impl NodeStruct {
     fn new(rtable: RoutingTable) -> NodeStruct {
 	NodeStruct {
 	    rtable,
+	    store: HashMap::new(),
 	    rpc: None,
 	}
     }
@@ -373,6 +542,9 @@ impl NodeStruct {
 mod test {
     use std::path::Path;
     use std::net::SocketAddr;
+    use std::collections::HashMap;
+
+    use futures::future::join_all;
 
     use rand::{
 	SeedableRng,
@@ -380,9 +552,11 @@ mod test {
     };
     use tempfile::TempDir;
     use test_log::test;
+    use log::trace;
 
     use super::Node;
-
+    use crate::routing::key::Key;
+    use crate::routing::constants::KAD_K;
 
     fn create_node<P: AsRef<Path>>(path: P) -> Node {
 	let mut rng = SmallRng::from_entropy();
@@ -461,7 +635,7 @@ mod test {
     }
 
     #[test]
-    fn test_node_minimal_bootstrap() {
+    fn test_node_minimal_functionality() {
 	const NODE_COUNT: usize = 40;
 	let (_tmp, nodes): (Vec<_>, Vec<_>) = NodeCreator::new("test_node_bootstrap")
 	    .take(NODE_COUNT)
@@ -489,6 +663,43 @@ mod test {
 
 	    for (i, routes) in routes.iter().enumerate() {
 		assert!(routes.len() >= 20, "Too few routes on node {}", i);
+	    }
+
+	    // Test storing from each node
+	    trace!("Begin insert...");
+	    let mut keys = HashMap::new();
+	    let results = join_all(
+		nodes.iter()
+		    .enumerate()
+		    .map(|(ndx, node)| {
+			 let key_str = format!("Key {}", ndx);
+			 let key = Key::from(key_str.as_str());
+			 keys.insert(key.clone(), (0, key_str.clone()));
+			 Box::pin(async move {
+			     trace!("{} Insert key", ndx);
+			     let mut data = Vec::new();
+			     data.extend_from_slice(key_str.as_bytes());
+			     node.store(key, data).await
+			 })
+		    })).await;
+	    // Check that all stores succeeded - i.e. at least K stores per key.
+	    for (ndx, result) in results.into_iter().enumerate() {
+		assert!(result.is_ok(), "Node {} failed", ndx);
+		let count = result.unwrap();
+		assert!(count >= KAD_K, "Node {} only stored to {} nodes", ndx, count);
+	    }
+	    // Validate and count all node contents
+	    for node in nodes.iter() {
+		for (key, val) in node.0.lock().unwrap().store.iter() {
+		    let check = keys.get_mut(key)
+			.expect("Key missing? Store contains wrong key!");
+		    assert!(val == check.1.as_bytes(), "Key {} not correctly stored", check.1);
+		    check.0 += 1;
+		}
+	    }
+	    // .. should be at least K copies of each key
+	    for (count, keystr) in keys.values() {
+		assert!(*count >= KAD_K, "Key {} only had {} copies", keystr, count);
 	    }
 	})
     }

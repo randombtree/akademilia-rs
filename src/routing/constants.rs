@@ -16,4 +16,4 @@ pub const MAX_ERRORS: usize = 5;
 pub const MAX_RTT_MS: u64 = 1500;
 
 /// Maximum concurrency per operation
-pub const KAD_ALPHA: i32 = 3;
+pub const KAD_ALPHA: usize = 3;
