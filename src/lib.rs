@@ -10,5 +10,4 @@ pub mod routing;
 pub mod node;
 pub mod util {
     pub mod ringbuffer;
-    pub(crate) mod futures;
 }

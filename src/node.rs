@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::future::Future;
 
 use futures::future::select_all;
-use futures::future::FutureExt;
+use futures::future::{Fuse, FutureExt};
 use futures::select;
 
 use rand::Rng;
@@ -49,7 +49,6 @@ use crate::routing::{
 	RTDiskV1,
     }
 };
-use crate::util::futures::PlaceholderFuture;
 
 mod spider;
 use self::spider::SpiderPeer;
@@ -185,8 +184,8 @@ impl NodeSpider {
 	let mut finders_finished = false;  // Once no more new nodes can be found, stop looking
 	let mut storers = Some(Vec::new());
 	let mut storers_count = 0;
-	let mut finders_fut = PlaceholderFuture::new();
-	let mut storers_fut = PlaceholderFuture::new();
+	let mut finders_fut = Fuse::terminated();
+	let mut storers_fut = Fuse::terminated();
 	let mut successfully_stored = 0;
 
 	loop {
@@ -198,7 +197,7 @@ impl NodeSpider {
 		finders_count = finders.len();
 		// select_all panics if iterator is empty :)
 		if finders_count > 0 {
-		    finders_fut.apply(Box::pin(select_all(finders.into_iter()).fuse()));
+		    finders_fut = select_all(finders.into_iter()).fuse();
 		} else {
 		    // Didn't find more nodes, don't bother searching the list anymore
 		    finders_finished = true;
@@ -239,7 +238,7 @@ impl NodeSpider {
 		storers_count = storers.len();
 		// select_all panics if iterator is empty :)
 		if storers_count > 0 {
-		    storers_fut.apply(Box::pin(select_all(storers.into_iter()).fuse()));
+		    storers_fut = select_all(storers.into_iter()).fuse();
 		}
 	    }
 
