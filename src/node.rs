@@ -698,7 +698,7 @@ mod test {
 	    }
 	    // .. should be at least K copies of each key
 	    for (count, keystr) in keys.values() {
-		assert!(*count >= KAD_K, "Key {} only had {} copies", keystr, count);
+		assert!(*count >= KAD_K && *count <= KAD_K + 2, "Key {} only had {} copies", keystr, count);
 	    }
 	})
     }
