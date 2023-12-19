@@ -8,6 +8,7 @@ use std::time::{
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::fmt::{Display, Formatter, Error as FmtError};
 
 use serde::{Deserialize, Serialize};
 
@@ -224,6 +225,16 @@ impl PartialOrd for RoutingPeer {
 impl Ord for RoutingPeer {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
 	self.partial_cmp(other).unwrap()
+    }
+}
+
+
+impl Display for RoutingPeer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
+	// Display distance and last known address
+	write!(f, "{} {}",
+	       self.distance,
+	       self.mutable.lock().map(|m| m.peer).unwrap())
     }
 }
 
