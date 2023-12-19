@@ -104,11 +104,20 @@ rpc! {
 	    }).expect("Memory corruption")
 	}
 
-	async fn find_value(&self, context: RpcContext) {
+	async fn find_value(&self, context: RpcContext, node_key: Key, find_key: Key) -> FindValue {
 	    trace!("find_value from {}", context.source);
-	    let _node = self.node()
+	    let node = self.node()
 		.expect("Node disappeared");
 
+	    node.0.lock().map(|mut node| {
+		node.update_peer_seen(context.source, node_key);
+		// Do we have it?
+		node.store.get(&find_key)
+		    .map(|value| FindValue::Value(value.clone()))
+		    // ... else return the closest nodes we know
+		    .unwrap_or_else(|| FindValue::Nodes(node.find_node(&find_key)))
+	    })
+		.unwrap_or_else(|_| FindValue::Nodes(Vec::new()))
 	}
     }
 }
@@ -121,8 +130,22 @@ struct NodeAddress {
 }
 
 
+/// Find value return value
+#[derive(Serialize, Deserialize)]
+enum FindValue {
+    Value(Vec<u8>),
+    Nodes(Vec<NodeAddress>),
+}
+
+/// This is the translated FindValue containing the translated Peer:s.
+pub enum ResolvedFindValue {
+    Value(Vec<u8>),
+    Nodes(Vec<Peer>),
+}
+
 struct NodeSpider {
     node: Node,
+    node_key: PeerAddress,
     target: PeerAddress,
     peers: BTreeSet<SpiderPeer>
 }
@@ -130,8 +153,10 @@ struct NodeSpider {
 
 impl NodeSpider {
     fn new(node: Node, target: PeerAddress) -> NodeSpider {
+	let node_key = node.node_key();
 	NodeSpider {
 	    node,
+	    node_key,
 	    target,
 	    peers: BTreeSet::new(),
 	}
@@ -145,11 +170,15 @@ impl NodeSpider {
 	where I: IntoIterator<Item = Peer>
     {
 	self.peers.extend(
-	    iter.into_iter().map(|peer| SpiderPeer::new(peer))
+	    iter.into_iter()
+		.filter(|peer| peer.address != self.node_key)
+		.map(|peer| SpiderPeer::new(peer))
 	);
     }
 
-    fn add_finders<'a>(&'a mut self, count: usize) -> impl Iterator<Item=Pin<Box<impl Future<Output=Option<Vec<Peer>>>>>> + 'a {
+    /// Get peers that have not been visited (or failed)
+    fn get_new_peers<'a>(&'a mut self, count: usize) -> impl Iterator<Item=(PeerAddress, SpiderPeer, Node)> +'a
+    {
 	self.peers.iter()
 	    .filter(|p| !p.has_failed())   // Ignore failed nodes
 	    .take(KAD_K)  // We continue until the KAD_K best nodes are probed
@@ -158,21 +187,28 @@ impl NodeSpider {
 	    .map(|p| {
 		p.set_visited();
 		// Shed any references
-		let target = (*self.target).clone();
+		let target = self.target.clone();
 		let spider_peer = p.clone();
 		let node = self.node.clone();
-		Box::pin(async move {
-		    let ret = node.find_node(spider_peer.peer(), target).await;
-		    if ret.is_none() {
-			trace!("Peer {} find_node failed", spider_peer.peer().peer());
-			// This node shouldn't count towards the KAD_K nodes returned
-			spider_peer.set_failed();
-		    } else {
-			spider_peer.set_finished();
-		    }
-		    ret
-		})
+		(target, spider_peer, node)
 	    })
+    }
+
+    fn add_finders<'a>(&'a mut self, count: usize) -> impl Iterator<Item=Pin<Box<impl Future<Output=Option<Vec<Peer>>>>>> + 'a {
+	self.get_new_peers(count)
+	    .map(|(target, spider_peer, node)|
+		 Box::pin(async move {
+		     let ret = node.find_node(spider_peer.peer(), *target).await;
+		     if ret.is_none() {
+			 trace!("Peer {} find_node failed", spider_peer.peer().peer());
+			 // This node shouldn't count towards the KAD_K nodes returned
+			 spider_peer.set_failed();
+		     } else {
+			 spider_peer.set_finished();
+		     }
+		     ret
+		})
+	    )
     }
 
     /// Store value to K closest peers
@@ -253,10 +289,7 @@ impl NodeSpider {
 		(resolved, _index, new_finders) = finders_fut => {
 		    finders_count -= 1;
 		    if let Some(list) = resolved {
-			self.peers.extend(
-			    list.into_iter()
-				.filter(|peer| peer.address != node_key)
-				.map(|peer| SpiderPeer::new(peer)));
+			self.extend(list);
 		    }
 		    finders = Some(new_finders);
 		},
@@ -273,10 +306,44 @@ impl NodeSpider {
 	}
     }
 
+    pub async fn find_value(&mut self) -> Option<Vec<u8>> {
+	trace!("Starting find_value");
+	let mut finders = Vec::new();
+	loop {
+	    let add = KAD_ALPHA - finders.len();
+	    (add > 0).then(| | finders.extend(
+		self.get_new_peers(add)
+		    .map(|(target, spider_peer, node)|
+			 Box::pin(async move {
+			     let ret = node.find_on(spider_peer.peer(), *target).await;
+			     if ret.is_none() {
+				 spider_peer.set_failed();
+			     }
+			     ret
+			 }))
+	    ));
+
+	    if finders.len() == 0 {
+		trace!("Key not found, ending search!");
+		return None;
+	    }
+
+	    let resolved;
+	    let _index;
+	    (resolved, _index, finders) = select_all(finders.into_iter()).await;
+	    if let Some(ret) = resolved {
+		use ResolvedFindValue::*;
+		match ret {
+		    Value(value) => return Some(value),
+		    Nodes(nodes) => self.extend(nodes),
+		}
+	    }
+	}
+    }
+
     /// Find K closest peers
     pub async fn find_node(&mut self) -> Vec<Peer> {
 	trace!("Starting find_node spider");
-	let node_key = self.node.node_key();
 	let mut finders = Vec::new();
 	loop {
 	    let add = KAD_ALPHA - finders.len();
@@ -296,13 +363,7 @@ impl NodeSpider {
 	    let resolved;
 	    let _index;
 	    (resolved, _index, finders) = select_all(finders.into_iter()).await;
-	    if let Some(list) = resolved {
-		self.peers.extend(
-		    list.into_iter()
-			.filter(|peer| peer.address != node_key)
-			.map(|peer| SpiderPeer::new(peer))
-		);
-	    }
+	    resolved.map(|list| self.extend(list));
 	}
     }
 }
@@ -416,7 +477,26 @@ impl Node {
 	let key = Arc::new(key);
 	let mut spider = NodeSpider::new(self.clone(), key.clone());
 	spider.extend(nodes);
+	// TODO: Store into local storage if key is within our keyspace
 	Ok(spider.store(value).await)
+    }
+
+    /// Find key from KAD network
+    pub async fn find<K>(&self, key: K) -> Result<Vec<u8>, ()>
+    where K: Into<Key>,
+    {
+	let key = key.into();
+	let nodes = self.0.lock().map(|node| node.rtable.find_node(&key))
+	    .expect("Memory corruption");
+	// TODO: Check local storage for key if key is within our keyspace (i.e. should be current))
+	if nodes.len() == 0 {
+	    info!("Node has no known routing peers, needs bootstrapping!");
+	    return Err(()) // TODO: Error
+	}
+	let key = Arc::new(key);
+	let mut spider = NodeSpider::new(self.clone(), key.clone());
+	spider.extend(nodes);
+	spider.find_value().await.ok_or(()) // TODO: Error
     }
 
     /// Bootstrap node from other node
@@ -448,36 +528,35 @@ impl Node {
 	Ok(())
     }
 
+    /// Do the time out for a kad rpc operation
+    async fn kad_rpc<Op: Future<Output=Result<R,E>>, R, E>(peer: &Peer, op: Op) -> Option<R> {
+	peer.update_try();
+	timeout(Duration::from_millis(MAX_RTT_MS), op).await
+	    .inspect_err(|_| {
+		trace!("{} - timed out", peer);
+		peer.inc_errors();
+	    })
+	    .map(|ret| {
+		ret.inspect_err(|_| {
+		    trace!("{} - RPC error", peer);
+		    peer.inc_errors();
+		}).ok()
+	    }).ok().flatten()
+	    .inspect(|_| peer.update_seen())
+    }
+
     pub(crate) async fn find_node(&self, peer: &Peer, key: Key) -> Option<Vec<Peer>> {
 	let (rpc, node_key) = self.0.lock().map(|node| {
 	    let rpc = node.rpc.clone().expect("Bug: Node not initialized");
 	    (rpc, (*node.rtable.node()).clone())
 	}).expect("Memory corruption");
 	let peer_socket = peer.peer();
-	peer.update_try();
-	trace!("find_node to {}", peer_socket);
-	timeout(Duration::from_millis(MAX_RTT_MS),
-		rpc.find_node(peer_socket, node_key, key)).await
-	    .inspect_err(|_| {
-		trace!("Peer {} timed out on find_node", peer_socket);
-		peer.inc_errors();
-	    })
-	    .map(|ret| {
-		ret.inspect_err(|_| {
-		    trace!("Peer {} RPC error", peer_socket);
-		    peer.inc_errors();
-		}).ok()
-	    }).ok().flatten()
-	    .inspect(|_| peer.update_seen())
-	    .map(|list| {
-		self.0.lock().map(|mut node| {
-		    list.into_iter()
-			.filter(|node_address| node_address.address != node_key)   // Our address
-			.map(|node_address| {
-			    node.rtable.get_peer(node_address.peer, node_address.address)
-			}).collect()
-		}).expect("Memory corruption")
-	    })
+	trace!("find_node to {}", peer);
+	Self::kad_rpc(peer, rpc.find_node(peer_socket, node_key, key)).await
+	    .map(|list| self.0.lock()
+		 .map(|mut node| node.resolve_nodes(list).collect())
+		 .expect("Memory corruption")
+	    )
     }
 
     pub(crate) async fn store_on(&self, peer: &Peer, key: Key, value: Vec<u8>) -> Option<()> {
@@ -486,20 +565,28 @@ impl Node {
 	    (rpc, (*node.rtable.node()).clone())
 	}).expect("Memory corruption");
 	let peer_socket = peer.peer();
-	peer.update_try();
-	timeout(Duration::from_millis(MAX_RTT_MS),
-		rpc.store(peer_socket, node_key, key, value)).await
-	    .inspect_err(|_| {
-		trace!("Peer {} timed out on find_node", peer_socket);
-		peer.inc_errors();
+	trace!("store_on {}", peer);
+	Self::kad_rpc(peer, rpc.store(peer_socket, node_key, key, value)).await
+    }
+
+    /// Find RPC to peer
+    pub (crate) async fn find_on(&self, peer: &Peer, key: Key) -> Option<ResolvedFindValue> {
+	let (rpc, node_key) = self.0.lock().map(|node| {
+	    let rpc = node.rpc.clone().expect("Bug: Node not initialized");
+	    (rpc, (*node.rtable.node()).clone())
+	}).expect("Memory corruption");
+	let peer_socket = peer.peer();
+	trace!("find_on {}", peer);
+
+	Self::kad_rpc(peer, rpc.find_value(peer_socket, node_key, key)).await
+	    .map(|ret| match ret {
+		FindValue::Value(v) =>
+		    ResolvedFindValue::Value(v),
+		FindValue::Nodes(n) =>
+		    ResolvedFindValue::Nodes(
+			self.0.lock().map(|mut node| node.resolve_nodes(n).collect())
+			    .expect("memory corruption"))
 	    })
-	    .map(|ret| {
-		ret.inspect_err(|_| {
-		    trace!("Peer {} RPC error", peer_socket);
-		    peer.inc_errors();
-		}).ok()
-	    }).ok().flatten()
-	    .inspect(|_| peer.update_seen())
     }
 }
 
@@ -533,6 +620,16 @@ impl NodeStruct {
 		peer: peer.peer(),
 	    }
 	}).collect()
+    }
+
+    /// Resolve the NodeAddresses to Peer:s
+    fn resolve_nodes<'a, I>(&'a mut self, iter: I) -> impl Iterator<Item=Peer> + 'a
+	where I: IntoIterator<Item = NodeAddress> +'static
+    {
+	let node_address = self.rtable.node.clone();
+	iter.into_iter()
+	    .filter(move |na| na.address != *node_address)
+	    .map(|na| self.rtable.get_peer(na.peer, na.address))
     }
 }
 
@@ -700,6 +797,24 @@ mod test {
 	    for (count, keystr) in keys.values() {
 		assert!(*count >= KAD_K && *count <= KAD_K + 2, "Key {} only had {} copies", keystr, count);
 	    }
+
+	    // Test fetching from each node
+
+	    for node in nodes.iter() {
+		let success = join_all(
+		    keys.keys()
+			.map(|k| node.find(*k))
+		).await.into_iter().all(|ret| ret.is_ok());
+		assert!(success, "Some keys failed to fetch");
+	    }
+
+	    // Test negative fetch (i.e. nonexistent key)
+
+	    let success = join_all(
+		nodes.iter()
+		    .map(|node| node.find("NoKey"))
+	    ).await.into_iter().all(|ret| ret.is_err());
+	    assert!(success, "Some non-existent keys did return values?");
 	})
     }
 }

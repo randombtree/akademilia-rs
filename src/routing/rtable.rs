@@ -29,7 +29,7 @@ pub(crate) struct RTDiskV1 {
 
 /// Kademlia routing table
 pub struct RoutingTable {
-    node: PeerAddress,
+    pub(crate) node: PeerAddress,
     buckets: Vec<KBucket>,
     peers: HashMap<PeerAddress, Weak<RoutingPeer>>,
 }
